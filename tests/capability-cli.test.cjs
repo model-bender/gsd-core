@@ -572,6 +572,116 @@ describe('capability install (--shared-file confinement)', () => {
   });
 });
 
+// ─── #5315: a symlinked --shared-file is refused or written through, never replaced ───
+// The issue's layout: ~/.claude/settings.json links into a dotfiles dir. Without
+// GSD_ALLOW_SYMLINKED_DEST the command must exit 1 and change nothing; with it the edit lands in
+// the link's target and the link stays. A blocked install puts nothing on stdout under --raw, and
+// the --json-errors reason (sdk_fail_fast) is the same for every failure, so these tests pin the
+// outcome through the exit code and the persisted state; the refusal message itself is pinned
+// in-process in tests/capability-lifecycle.test.cjs.
+
+describe('capability install/remove (#5315: symlinked --shared-file)', () => {
+  const { CAP_MARKER } = require('../gsd-core/bin/lib/capability-lifecycle.cjs');
+  const USER_SETTINGS = '{"model":"keep-me"}\n';
+
+  // A global scope whose .claude/settings.json links to a file in a separate dotfiles dir.
+  // Returns null when this platform or account cannot create symlinks.
+  function linkedScope() {
+    const home = tmpDir('cap-cli-home-');
+    const dotfiles = tmpDir('cap-cli-dotfiles-');
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    const targetPath = path.join(dotfiles, 'settings.json');
+    const linkPath = path.join(home, '.claude', 'settings.json');
+    fs.writeFileSync(targetPath, USER_SETTINGS);
+    try {
+      fs.symlinkSync(targetPath, linkPath, 'file');
+    } catch {
+      return null;
+    }
+    return { home, targetPath, linkPath };
+  }
+
+  function optInEnv(home, optIn) {
+    return { ...scopeEnv(home), GSD_ALLOW_SYMLINKED_DEST: optIn ? '1' : '' };
+  }
+
+  function installLinked(s, src, optIn) {
+    return runGsdTools(
+      ['capability', 'install', src, '--scope', 'global', '--yes', '--shared-file', '.claude/settings.json', '--raw'],
+      makeCwd(), optInEnv(s.home, optIn),
+    );
+  }
+
+  function removeLinked(s, id, optIn) {
+    return runGsdTools(['capability', 'remove', id, '--scope', 'global', '--raw'], makeCwd(), optInEnv(s.home, optIn));
+  }
+
+  function assertLinkIntact(s) {
+    assert.ok(fs.lstatSync(s.linkPath).isSymbolicLink(), 'settings.json must still be a symlink');
+    assert.equal(fs.readlinkSync(s.linkPath), s.targetPath, 'the link must still point at the same target');
+  }
+
+  function readTarget(s) { return JSON.parse(fs.readFileSync(s.targetPath, 'utf8')); }
+
+  test('install without GSD_ALLOW_SYMLINKED_DEST exits 1 and changes nothing', (t) => {
+    const s = linkedScope();
+    if (!s) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+    const src = writeCapSource('linkcap', { mcp: { demo: { command: 'echo' } } });
+    const r = installLinked(s, src, false);
+    // 1, not merely non-zero: a killed or timed-out child reports something else.
+    assert.equal(r.exitCode, 1, `a refused shared-file write must fail the install\n${r.output}\n${r.error}`);
+    assertLinkIntact(s);
+    assert.equal(fs.readFileSync(s.targetPath, 'utf8'), USER_SETTINGS, 'the link target must be byte-for-byte unchanged');
+    assert.equal(readLedgerEntry(s.home, 'linkcap'), null, 'no ledger entry, committed or pending');
+    assert.equal(fs.existsSync(capDir(s.home, 'linkcap')), false, 'the bundle must not be promoted');
+    const staging = path.join(s.home, '.gsd', 'capabilities', '.staging');
+    assert.deepEqual(fs.existsSync(staging) ? fs.readdirSync(staging) : [], [], 'staging cleaned');
+  });
+
+  test('install with GSD_ALLOW_SYMLINKED_DEST=1 writes through to the link target and the link survives', (t) => {
+    const s = linkedScope();
+    if (!s) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+    const src = writeCapSource('linkcap', { mcp: { demo: { command: 'echo' } } });
+    const r = installLinked(s, src, true);
+    assert.equal(r.success, true, `install failed: ${r.error || r.output}`);
+    assert.equal(parse(r.output).status, 'installed');
+    assertLinkIntact(s);
+    const after = readTarget(s);
+    assert.equal(after.model, 'keep-me', 'user settings must survive the write-through');
+    assert.equal(after.mcpServers.demo[CAP_MARKER], 'linkcap', 'the capability entry must land in the link target');
+  });
+
+  test('remove without GSD_ALLOW_SYMLINKED_DEST exits 1 and leaves the capability installed', (t) => {
+    const s = linkedScope();
+    if (!s) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+    const src = writeCapSource('linkcap', { mcp: { demo: { command: 'echo' } } });
+    assert.equal(installLinked(s, src, true).success, true, 'setup: the opt-in install must succeed');
+    assertLinkIntact(s);
+    const beforeRemove = fs.readFileSync(s.targetPath, 'utf8');
+    const r = removeLinked(s, 'linkcap', false);
+    assert.equal(r.exitCode, 1, `a refused shared-file write must fail the remove\n${r.output}\n${r.error}`);
+    assertLinkIntact(s);
+    assert.equal(fs.readFileSync(s.targetPath, 'utf8'), beforeRemove, 'the link target must be byte-for-byte unchanged');
+    assert.ok(readLedgerEntry(s.home, 'linkcap'), 'the ledger entry must survive a refused remove');
+    assert.ok(fs.existsSync(path.join(capDir(s.home, 'linkcap'), 'capability.json')), 'the bundle must survive a refused remove');
+  });
+
+  test('remove with GSD_ALLOW_SYMLINKED_DEST=1 strips the entry from the link target and the link survives', (t) => {
+    const s = linkedScope();
+    if (!s) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+    const src = writeCapSource('linkcap', { mcp: { demo: { command: 'echo' } } });
+    assert.equal(installLinked(s, src, true).success, true, 'setup: the opt-in install must succeed');
+    const r = removeLinked(s, 'linkcap', true);
+    assert.equal(r.success, true, `remove failed: ${r.error || r.output}`);
+    const o = parse(r.output);
+    assert.equal(o.status, 'removed');
+    assert.equal(o.strippedEdits, 1);
+    assertLinkIntact(s);
+    assert.deepEqual(readTarget(s), { model: 'keep-me' }, 'the link target is back to the user settings alone');
+    assert.equal(readLedgerEntry(s.home, 'linkcap'), null, 'ledger entry gone');
+  });
+});
+
 describe('capability install (config policy fail-closed)', () => {
   test('an unparseable project config fails CLOSED — an external source is blocked, not silently permitted', () => {
     const cwd = tmpDir('cap-cli-cwd-');

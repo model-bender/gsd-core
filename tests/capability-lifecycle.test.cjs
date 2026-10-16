@@ -3442,3 +3442,430 @@ test('#3514: a git #sha:<hex-commit> source renders commit-pinned; a #sha:<mutab
   assert.strictEqual(mutable.disclosure.integrityStatus, 'unverified',
     'a #sha:<non-hex> ref is a moving ref and must not render as pinned');
 });
+
+// ---------------------------------------------------------------------------
+// #5315: a symlinked shared file is refused or written through, never replaced
+// ---------------------------------------------------------------------------
+// A dotfiles setup links settings.json to a file kept elsewhere. Shared-file edits are saved
+// through a temp file and a rename, and the rename replaced the link with a plain file, so the
+// dotfiles target silently stopped receiving changes. Without GSD_ALLOW_SYMLINKED_DEST the
+// operation must stop, name the opt-in and change nothing; with it the edit lands in the link's
+// target and the link stays in place.
+
+const USER_SHARED_SETTINGS = { model: 'keep-me' };
+
+/**
+ * Restore GSD_ALLOW_SYMLINKED_DEST when the test ends and return a setter for it, so a test can
+ * install with the opt-in and then drop it for the step under test.
+ */
+function useSymlinkOptIn(t) {
+  const saved = process.env.GSD_ALLOW_SYMLINKED_DEST;
+  t.after(() => {
+    if (saved === undefined) delete process.env.GSD_ALLOW_SYMLINKED_DEST;
+    else process.env.GSD_ALLOW_SYMLINKED_DEST = saved;
+  });
+  return (value) => {
+    if (value === undefined) delete process.env.GSD_ALLOW_SYMLINKED_DEST;
+    else process.env.GSD_ALLOW_SYMLINKED_DEST = value;
+  };
+}
+
+/**
+ * Link <dir>/settings.json to a settings file holding `content` in a separate dotfiles dir.
+ * Returns null when this platform or account cannot create symlinks.
+ */
+function linkSharedSettings(dir, content = USER_SHARED_SETTINGS) {
+  const dotfiles = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-life-dotfiles-'));
+  cleanups.push(dotfiles);
+  const targetPath = path.join(dotfiles, 'settings.json');
+  const linkPath = path.join(dir, 'settings.json');
+  fs.writeFileSync(targetPath, JSON.stringify(content, null, 2) + '\n');
+  try {
+    fs.symlinkSync(targetPath, linkPath, 'file');
+  } catch {
+    return null;
+  }
+  return { linkPath, targetPath, before: fs.readFileSync(targetPath, 'utf8') };
+}
+
+function assertLinkIntact(l) {
+  assert.ok(fs.lstatSync(l.linkPath).isSymbolicLink(), 'settings.json must still be a symlink');
+  assert.strictEqual(fs.readlinkSync(l.linkPath), l.targetPath, 'the link must still point at the same target');
+}
+
+function assertTargetUnchanged(l, before = l.before) {
+  assert.strictEqual(fs.readFileSync(l.targetPath, 'utf8'), before, 'the link target must be byte-for-byte unchanged');
+}
+
+function readLinkTarget(l) {
+  return JSON.parse(fs.readFileSync(l.targetPath, 'utf8'));
+}
+
+function mcpCap(id, version, script = 'hooks/run.js') {
+  return execCap(id, version, { script, mcp: { 'cap-srv': { command: 'node' } } });
+}
+
+function capabilityDirNames(dir) {
+  const root = path.join(dir, '.gsd', 'capabilities');
+  return fs.existsSync(root) ? fs.readdirSync(root).filter((n) => n !== '.lock') : [];
+}
+
+function stagingEntries(dir) {
+  const staging = path.join(dir, '.gsd', 'capabilities', '.staging');
+  return fs.existsSync(staging) ? fs.readdirSync(staging) : [];
+}
+
+test('#5315: apply refuses a symlinked shared file without the opt-in and leaves the link and its target alone', (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  assert.throws(
+    () => lifecycle.applyCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', manifest: mcpCap('e', '1.0.0'), sharedFiles: ['settings.json'] }),
+    /GSD_ALLOW_SYMLINKED_DEST=1/,
+  );
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: apply refuses before writing any shared file, so a plain file listed first is not edited', (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  assert.throws(
+    () => lifecycle.applyCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', manifest: mcpCap('e', '1.0.0'), sharedFiles: ['plain.json', 'settings.json'] }),
+    /GSD_ALLOW_SYMLINKED_DEST=1/,
+  );
+  assert.strictEqual(fs.existsSync(path.join(dir, 'plain.json')), false, 'the plain shared file must not be written');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: with the opt-in, apply writes through to the link target and the link survives', (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const records = lifecycle.applyCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', manifest: mcpCap('e', '1.0.0'), sharedFiles: ['settings.json'] });
+  assert.deepStrictEqual(records, [{ file: 'settings.json', marker: 'e' }]);
+  assertLinkIntact(l);
+  const after = readLinkTarget(l);
+  assert.strictEqual(after.model, 'keep-me', 'user settings must survive the write-through');
+  assert.strictEqual(after.mcpServers['cap-srv'][CAP_MARKER], 'e', 'the capability entry must land in the link target');
+  assert.strictEqual(after.hooks.PostToolUse[0][CAP_MARKER], 'e');
+  assert.deepStrictEqual(fs.readdirSync(path.dirname(l.targetPath)), ['settings.json'], 'no temp file may be left beside the target');
+});
+
+test('#5315: strip refuses a symlinked shared file holding the capability entries without the opt-in', (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  const l = linkSharedSettings(dir, { ...USER_SHARED_SETTINGS, mcpServers: { 'cap-srv': { command: 'node', [CAP_MARKER]: 'e' } } });
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  assert.throws(
+    () => lifecycle.stripCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', sharedEdits: [{ file: 'settings.json', marker: 'e' }] }),
+    /GSD_ALLOW_SYMLINKED_DEST=1/,
+  );
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: with the opt-in, strip removes the capability entries from the link target and the link survives', (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = linkSharedSettings(dir, { ...USER_SHARED_SETTINGS, mcpServers: { 'cap-srv': { command: 'node', [CAP_MARKER]: 'e' } } });
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const stripped = lifecycle.stripCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', sharedEdits: [{ file: 'settings.json', marker: 'e' }] });
+  assert.strictEqual(stripped, 1);
+  assertLinkIntact(l);
+  assert.deepStrictEqual(readLinkTarget(l), USER_SHARED_SETTINGS, 'only the capability entry is removed from the link target');
+});
+
+test('#5315: strip leaves a symlinked shared file with none of the capability entries alone, without refusing', (t) => {
+  // Nothing would be written, so there is no rename to protect the link from: refusing here would
+  // only block a remove for no reason.
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const stripped = lifecycle.stripCapabilitySharedEdits({ runtimeDir: dir, capId: 'e', sharedEdits: [{ file: 'settings.json', marker: 'e' }] });
+  assert.strictEqual(stripped, 0);
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: install without the opt-in is blocked before its intent is recorded, so nothing changes', async (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const res = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['plain.json', 'settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0')),
+  });
+  assert.strictEqual(res.status, 'blocked');
+  assert.strictEqual(readLedgerEntry(dir, 'e'), null, 'no ledger entry, committed or pending');
+  assert.deepStrictEqual(capabilityDirNames(dir).filter((n) => n !== '.staging'), [], 'no bundle promoted and no backup left');
+  assert.deepStrictEqual(stagingEntries(dir), [], 'staging cleaned');
+  assert.strictEqual(fs.existsSync(path.join(dir, 'plain.json')), false, 'no other shared file may be edited');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: with the opt-in, install writes the capability entries through to the link target', async (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const res = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0')),
+  });
+  assert.strictEqual(res.status, 'installed');
+  assertLinkIntact(l);
+  const after = readLinkTarget(l);
+  assert.strictEqual(after.model, 'keep-me');
+  assert.strictEqual(after.mcpServers['cap-srv'][CAP_MARKER], 'e');
+  assert.deepStrictEqual(readLedgerEntry(dir, 'e').sharedEdits, [{ file: 'settings.json', marker: 'e' }]);
+});
+
+test('#5315: update without the opt-in is blocked before its intent is recorded, leaving the old version intact', async (t) => {
+  const setOptIn = useSymlinkOptIn(t);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  setOptIn('1');
+  const installed = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0', 'hooks/a.js')),
+  });
+  assert.strictEqual(installed.status, 'installed');
+  assertLinkIntact(l);
+  const beforeUpdate = fs.readFileSync(l.targetPath, 'utf8');
+
+  setOptIn(undefined);
+  const res = await lifecycle.upgradeCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '2.0.0', 'hooks/b.js')),
+  });
+  assert.strictEqual(res.status, 'blocked');
+  const entry = readLedgerEntry(dir, 'e');
+  assert.strictEqual(entry.version, '1.0.0', 'the ledger still records the old version');
+  assert.strictEqual(entry._pending, undefined, 'no update intent may be left behind');
+  assert.strictEqual(capManifestVersion(dir, 'e'), '1.0.0', 'the old bundle stays live');
+  assert.deepStrictEqual(capabilityDirNames(dir).filter((n) => n !== '.staging'), ['e'], 'no backup dir left');
+  assert.deepStrictEqual(stagingEntries(dir), [], 'staging cleaned');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l, beforeUpdate);
+});
+
+test('#5315: with the opt-in, update re-derives the capability entries in the link target', async (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0', 'hooks/a.js')),
+  });
+  const res = await lifecycle.upgradeCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '2.0.0', 'hooks/b.js')),
+  });
+  assert.strictEqual(res.status, 'upgraded');
+  assertLinkIntact(l);
+  const after = readLinkTarget(l);
+  assert.strictEqual(after.model, 'keep-me');
+  assert.strictEqual(after.hooks.PostToolUse.length, 1, 'the old hook is stripped and the new one applied');
+  assert.strictEqual(after.hooks.PostToolUse[0].hooks[0].command, nodeQuoted(expectedBundleCommand(dir, 'e', 'hooks/b.js')));
+  assert.strictEqual(after.mcpServers['cap-srv'][CAP_MARKER], 'e');
+});
+
+test('#5315: remove without the opt-in is blocked before anything is deleted', async (t) => {
+  const setOptIn = useSymlinkOptIn(t);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  setOptIn('1');
+  await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0')),
+  });
+  assertLinkIntact(l);
+  const beforeRemove = fs.readFileSync(l.targetPath, 'utf8');
+
+  setOptIn(undefined);
+  const res = lifecycle.removeCapability('e', { runtimeDir: dir });
+  assert.strictEqual(res.status, 'blocked');
+  assert.ok(readLedgerEntry(dir, 'e'), 'the ledger entry must survive a refused remove');
+  assert.ok(fs.existsSync(path.join(dir, '.gsd', 'capabilities', 'e', 'capability.json')), 'the bundle must survive a refused remove');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l, beforeRemove);
+});
+
+test('#5315: with the opt-in, remove strips the capability entries from the link target', async (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0')),
+  });
+  const res = lifecycle.removeCapability('e', { runtimeDir: dir });
+  assert.strictEqual(res.status, 'removed');
+  assert.strictEqual(res.strippedEdits, 2, 'the hook and the MCP server entry are both stripped');
+  assertLinkIntact(l);
+  assert.deepStrictEqual(readLinkTarget(l), USER_SHARED_SETTINGS, 'the link target is back to the user settings alone');
+});
+
+test('#5315: remove refuses before stripping any shared file, so a plain file listed first keeps its entries', async (t) => {
+  const setOptIn = useSymlinkOptIn(t);
+  const dir = runtime();
+  const l = linkSharedSettings(dir);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  setOptIn('1');
+  const installed = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['plain.json', 'settings.json'],
+    _resolve: fakeResolve(mcpCap('e', '1.0.0')),
+  });
+  assert.strictEqual(installed.status, 'installed');
+  assertLinkIntact(l);
+  const plainPath = path.join(dir, 'plain.json');
+  const plainBefore = fs.readFileSync(plainPath, 'utf8');
+  assert.strictEqual(JSON.parse(plainBefore).mcpServers['cap-srv'][CAP_MARKER], 'e', 'setup: the plain file holds an entry to strip');
+  const targetBefore = fs.readFileSync(l.targetPath, 'utf8');
+
+  setOptIn(undefined);
+  const res = lifecycle.removeCapability('e', { runtimeDir: dir });
+  assert.strictEqual(res.status, 'blocked');
+  assert.strictEqual(fs.readFileSync(plainPath, 'utf8'), plainBefore, 'the plain shared file listed first must not be stripped');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l, targetBefore);
+});
+
+test('#5315: reconcile without the opt-in keeps a crashed install pending instead of replacing a symlinked shared file', (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  seedCapDir(dir, 'f', mcpCap('f', '1.0.0'));
+  const l = linkSharedSettings(dir, { ...USER_SHARED_SETTINGS, mcpServers: { 'cap-srv': { command: 'node', [CAP_MARKER]: 'f' } } });
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  recordPending(dir, 'f', '1.0.0', { kind: 'install', backupName: null, sharedFiles: ['settings.json'] });
+  const report = lifecycle.reconcileCapabilities({ runtimeDir: dir });
+  assert.strictEqual(report.rolledBack.includes('f'), false, 'the rollback must not complete');
+  assert.strictEqual(report.warnings.length, 1, 'the refusal must be reported, not swallowed');
+  assert.ok(readLedgerEntry(dir, 'f')._pending, 'the intent stays so a later run can retry');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: reconcile without the opt-in keeps a crashed upgrade pending instead of re-syncing through a symlinked shared file', (t) => {
+  useSymlinkOptIn(t)(undefined);
+  const dir = runtime();
+  seedCapDir(dir, 'c', mcpCap('c', '2.0.0', 'hooks/new.js')); // new, uncommitted, live
+  seedCapDir(dir, 'c.upgrading-111-222', mcpCap('c', '1.0.0', 'hooks/old.js')); // old backup
+  const l = linkSharedSettings(dir, { ...USER_SHARED_SETTINGS, mcpServers: { 'cap-srv': { command: 'node', [CAP_MARKER]: 'c' } } });
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  recordPending(dir, 'c', '1.0.0', { backupName: 'c.upgrading-111-222', sharedFiles: ['settings.json'] });
+  const report = lifecycle.reconcileCapabilities({ runtimeDir: dir });
+  assert.strictEqual(report.rolledBack.includes('c'), false, 'the rollback must not complete');
+  assert.strictEqual(report.warnings.length, 1, 'the refusal must be reported, not swallowed');
+  assert.ok(readLedgerEntry(dir, 'c')._pending, 'the intent stays so a later run can retry');
+  assertLinkIntact(l);
+  assertTargetUnchanged(l);
+});
+
+test('#5315: with the opt-in, unsafe shared paths are still skipped and nothing is written outside the scope', (t) => {
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const scope = path.join(dir, 'scope');
+  fs.mkdirSync(scope);
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-life-outside-'));
+  cleanups.push(outside);
+  try {
+    fs.symlinkSync(outside, path.join(scope, 'evil'), 'dir');
+  } catch {
+    t.skip('symlink creation unsupported on this platform/privilege');
+    return;
+  }
+  const records = lifecycle.applyCapabilitySharedEdits({
+    runtimeDir: scope, capId: 'e', manifest: mcpCap('e', '1.0.0'),
+    sharedFiles: ['evil/settings.json', '../settings.json', path.join(outside, 'abs.json')],
+  });
+  assert.deepStrictEqual(records, [], 'every unsafe path is skipped');
+  assert.deepStrictEqual(fs.readdirSync(outside), [], 'nothing is written through the escaping directory link or the absolute path');
+  assert.strictEqual(fs.existsSync(path.join(dir, 'settings.json')), false, 'nothing is written above the scope root');
+});
+
+test('#5315: with the opt-in, a symlinked shared file under a scope root reached through a symlinked path is written through', (t) => {
+  // macOS reaches temp and some home dirs through /var -> /private/var. The refusal check must be
+  // rooted at the shared file's own real directory, or the lexical comparison against the scope
+  // root as given would refuse this write even with the opt-in.
+  useSymlinkOptIn(t)('1');
+  const real = runtime();
+  const alias = path.join(runtime(), 'alias');
+  try {
+    fs.symlinkSync(real, alias, 'dir');
+  } catch {
+    t.skip('symlink creation unsupported on this platform/privilege');
+    return;
+  }
+  const l = linkSharedSettings(real);
+  if (!l) { t.skip('symlink creation unsupported on this platform/privilege'); return; }
+  const records = lifecycle.applyCapabilitySharedEdits({ runtimeDir: alias, capId: 'e', manifest: mcpCap('e', '1.0.0'), sharedFiles: ['settings.json'] });
+  assert.deepStrictEqual(records, [{ file: 'settings.json', marker: 'e' }]);
+  assertLinkIntact(l);
+  assert.strictEqual(readLinkTarget(l).mcpServers['cap-srv'][CAP_MARKER], 'e');
+});
+
+test('#5315: with the opt-in, a link and its target both named as shared files are saved once, with nothing lost', async (t) => {
+  // Both names reach one real file. If each name were planned and saved separately, the strip-only
+  // name would be saved last and overwrite the update's new hook.
+  useSymlinkOptIn(t)('1');
+  const dir = runtime();
+  const l = { linkPath: path.join(dir, 'settings.json'), targetPath: path.join(dir, 'real.json') };
+  fs.writeFileSync(l.targetPath, JSON.stringify(USER_SHARED_SETTINGS, null, 2) + '\n');
+  try {
+    fs.symlinkSync(l.targetPath, l.linkPath, 'file');
+  } catch {
+    t.skip('symlink creation unsupported on this platform/privilege');
+    return;
+  }
+  const installed = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json', 'real.json'],
+    _resolve: fakeResolve(execCap('e', '1.0.0', { script: 'hooks/a.js' })),
+  });
+  assert.strictEqual(installed.status, 'installed');
+  const res = await lifecycle.upgradeCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(execCap('e', '2.0.0', { script: 'hooks/b.js' })),
+  });
+  assert.strictEqual(res.status, 'upgraded');
+  assertLinkIntact(l);
+  const after = readLinkTarget(l);
+  assert.strictEqual(after.model, 'keep-me');
+  const commands = ((after.hooks && after.hooks.PostToolUse) || []).map((e) => e.hooks[0].command);
+  assert.deepStrictEqual(commands, [nodeQuoted(expectedBundleCommand(dir, 'e', 'hooks/b.js'))],
+    'the v1 hooks are stripped under both names and the v2 hook is kept');
+});
+
+test('#5315: an update whose only hook apply skips adds no empty hooks object to a plain shared file', async () => {
+  // Strip and apply share one in-memory plan, and apply always sets `hooks`. Editing the planned
+  // object in place would save `"hooks": {}` here, where strip then apply used to re-read the file.
+  const dir = runtime();
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(USER_SHARED_SETTINGS, null, 2) + '\n');
+  const installed = await lifecycle.installCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(execCap('e', '1.0.0')),
+  });
+  assert.strictEqual(installed.status, 'installed');
+  assert.strictEqual(readSettings(dir).hooks.PostToolUse[0][CAP_MARKER], 'e', 'setup: the v1 hook is applied');
+  const v2 = execCap('e', '2.0.0', { script: 'hooks/b.js' });
+  v2.hooks = [{ event: 'constructor', script: 'hooks/b.js' }]; // an unsafe event key, which apply skips
+  const res = await lifecycle.upgradeCapability('./e', {
+    runtimeDir: dir, hostVersion: '1.6.0', consentGranted: true, sharedFiles: ['settings.json'],
+    _resolve: fakeResolve(v2),
+  });
+  assert.strictEqual(res.status, 'upgraded');
+  assert.deepStrictEqual(readSettings(dir), USER_SHARED_SETTINGS, 'the v1 hook is stripped and no empty hooks object is added');
+});
