@@ -416,6 +416,80 @@ function confinedSharedFile(runtimeDir: string, relFile: unknown): string | null
   return path.join(realParent, path.basename(target));
 }
 
+/**
+ * Lazily require install-engine.cjs's `resolveSymlinkedLeafWritePath`, the symlinked-file write
+ * policy writeSettings and the Codex hooks.json writer already share (#5037). Required at call time
+ * because install-engine loads many modules this one otherwise never needs, and most capability
+ * commands write no shared file.
+ */
+interface InstallEngineSymlinkGuard {
+  resolveSymlinkedLeafWritePath: (installRoot: string, targetPath: string, label: string) => string;
+}
+
+function _installEngineSymlinkGuard(): InstallEngineSymlinkGuard {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  return require('./install-engine.cjs') as InstallEngineSymlinkGuard;
+}
+
+/**
+ * Where an edit to `file`, a confinedSharedFile result, is saved (#5315). writeJsonFileAtomic saves
+ * through a temp file and a rename, and a rename onto a symlink replaces the link with a plain file,
+ * so a dotfiles-managed settings.json would silently stop receiving changes. A symlinked file is
+ * therefore refused with an error naming GSD_ALLOW_SYMLINKED_DEST unless that opt-in is set; with it
+ * the link's real target is returned, so the temp file and the rename land beside the real file and
+ * the link stays. A dangling link is refused either way. The policy is checked from the file's own
+ * directory, which confinedSharedFile has already realpathed and confined to the scope root, so a
+ * scope root reached through a symlinked path (macOS /var -> /private/var) is not mistaken for an
+ * untrusted link.
+ */
+function sharedFileWritePath(file: string): string {
+  return _installEngineSymlinkGuard().resolveSymlinkedLeafWritePath(path.dirname(file), file, 'capability shared file');
+}
+
+/**
+ * Shared-file edits held in memory until every file has been planned (#5315), keyed by
+ * sharedFilePlanKey. Each entry holds the edited settings and the path the save goes to. Saving
+ * only after planning everything means a refused symlink stops the whole operation before any file
+ * is written, so none is left half-edited.
+ */
+type SharedFilePlan = Map<string, { writePath: string; settings: Record<string, unknown> }>;
+
+/**
+ * The plan key for `file`: its real path, so two shared-file names for one file (a link and its
+ * target, both named under the opt-in) share one entry and one save instead of the later save
+ * overwriting the earlier one. A missing file or dangling link keys by its own path.
+ */
+function sharedFilePlanKey(file: string): string {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
+/**
+ * The settings to edit: a copy of an earlier step's planned edit of `file`, else the file on disk.
+ * A copy, because apply always sets `hooks` and `mcpServers`: on the planned object itself an apply
+ * that changes nothing would still save an empty `hooks` object the old re-read from disk dropped.
+ */
+function plannedSettings(plan: SharedFilePlan, file: string): Record<string, unknown> | null {
+  const planned = plan.get(sharedFilePlanKey(file));
+  return planned ? structuredClone(planned.settings) : readJsonFile(file);
+}
+
+/**
+ * Plan saving `settings` to `file`, resolving where the save goes. Throws on a refused symlink,
+ * checked for every name that needs a write, even one whose real file is already planned under
+ * another name.
+ */
+function planSharedFileWrite(plan: SharedFilePlan, file: string, settings: Record<string, unknown>): void {
+  plan.set(sharedFilePlanKey(file), { writePath: sharedFileWritePath(file), settings });
+}
+
+function commitSharedFilePlan(plan: SharedFilePlan): void {
+  for (const { writePath, settings } of plan.values()) writeJsonFileAtomic(writePath, settings);
+}
+
 // #1460 (R) HIGH — shell-safe hook-script allowlist (mirrors capability-validator.cjs
 // isSafeHookScriptPath; see confinedBundleScript for why). Only [A-Za-z0-9._/-], no leading
 // `-` segment, no `..`, not absolute.
@@ -586,18 +660,32 @@ function promoteStagingToFinal(
  * surfaces (from `manifest`) into `applyFiles`. Centralized so the security-critical strip→apply
  * pair cannot diverge across the three callers. Returns the resulting sharedEdits records.
  */
-function reapplyCapabilitySharedEdits(args: {
+function reapplyCapabilitySharedEdits(args: ReapplySharedEditsArgs): Array<{ file: string; marker: string }> {
+  const plan: SharedFilePlan = new Map();
+  const records = planReapplyCapabilitySharedEdits(plan, args);
+  commitSharedFilePlan(plan);
+  return records;
+}
+
+interface ReapplySharedEditsArgs {
   runtimeDir: string;
   capId: string;
   stripFiles: string[];
   applyFiles: string[];
   manifest: Record<string, unknown>;
-}): Array<{ file: string; marker: string }> {
+}
+
+/**
+ * Plan reapplyCapabilitySharedEdits's strip and apply into one plan without saving anything, so a
+ * file both touch is saved once and a refused symlink (#5315) is thrown before any file is written.
+ * install and upgrade also call it as a dry run before recording their intent.
+ */
+function planReapplyCapabilitySharedEdits(plan: SharedFilePlan, args: ReapplySharedEditsArgs): Array<{ file: string; marker: string }> {
   const { runtimeDir, capId, stripFiles, applyFiles, manifest } = args;
   if (stripFiles.length > 0) {
-    stripCapabilitySharedEdits({ runtimeDir, capId, sharedEdits: stripFiles.map((file) => ({ file, marker: capId })) });
+    planStripCapabilitySharedEdits(plan, { runtimeDir, capId, sharedEdits: stripFiles.map((file) => ({ file, marker: capId })) });
   }
-  return applyCapabilitySharedEdits({ runtimeDir, capId, manifest, sharedFiles: applyFiles });
+  return planApplyCapabilitySharedEdits(plan, { runtimeDir, capId, manifest, sharedFiles: applyFiles });
 }
 
 /**
@@ -632,13 +720,27 @@ function resyncCapabilitySharedEdits(args: {
  * Operates on the settings.json hook shape (`hooks[event][] = { hooks: [...] }`) and the
  * mcpServers map (`mcpServers[name] = {...}`), which covers the settings.json-family runtimes;
  * runtime-specific command resolution is layered in Phase 5.
+ *
+ * A symlinked shared file is refused unless GSD_ALLOW_SYMLINKED_DEST is set, and with it the edit
+ * is saved to the link's target (#5315, see sharedFileWritePath). Every file is planned before any
+ * is saved, so a refusal leaves all of them untouched.
  */
-function applyCapabilitySharedEdits(args: {
+function applyCapabilitySharedEdits(args: ApplySharedEditsArgs): Array<{ file: string; marker: string }> {
+  const plan: SharedFilePlan = new Map();
+  const records = planApplyCapabilitySharedEdits(plan, args);
+  commitSharedFilePlan(plan);
+  return records;
+}
+
+interface ApplySharedEditsArgs {
   runtimeDir: string;
   capId: string;
   manifest: Record<string, unknown>;
   sharedFiles: string[];
-}): Array<{ file: string; marker: string }> {
+}
+
+/** applyCapabilitySharedEdits's edits, added to `plan` instead of saved. */
+function planApplyCapabilitySharedEdits(plan: SharedFilePlan, args: ApplySharedEditsArgs): Array<{ file: string; marker: string }> {
   const { runtimeDir, capId, manifest, sharedFiles } = args;
   const records: Array<{ file: string; marker: string }> = [];
 
@@ -665,7 +767,7 @@ function applyCapabilitySharedEdits(args: {
   for (const relFile of sharedFiles) {
     const file = confinedSharedFile(runtimeDir, relFile);
     if (file === null) continue; // unsafe path (absolute / .. / symlink escaping the scope root)
-    const settings = readJsonFile(file) ?? {};
+    const settings = plannedSettings(plan, file) ?? {};
     let touched = false;
 
     if (hooks.length > 0) {
@@ -739,7 +841,7 @@ function applyCapabilitySharedEdits(args: {
     }
 
     if (touched) {
-      writeJsonFileAtomic(file, settings);
+      planSharedFileWrite(plan, file, settings);
       records.push({ file: relFile, marker: capId });
     }
   }
@@ -750,19 +852,33 @@ function applyCapabilitySharedEdits(args: {
  * Surgically remove a capability's owned entries (those stamped CAP_MARKER === capId) from each
  * recorded shared-config file, leaving everything else — including user hand-edits — untouched.
  * Idempotent: tolerates a missing/unparseable file or already-removed entries.
+ *
+ * Only a file that actually holds this capability's entries is saved, so only such a file can be
+ * refused as a symlink (#5315, same policy as applyCapabilitySharedEdits): a link with nothing to
+ * strip, or a dangling one, is left alone rather than blocking a remove.
  */
-function stripCapabilitySharedEdits(args: {
+function stripCapabilitySharedEdits(args: StripSharedEditsArgs): number {
+  const plan: SharedFilePlan = new Map();
+  const stripped = planStripCapabilitySharedEdits(plan, args);
+  commitSharedFilePlan(plan);
+  return stripped;
+}
+
+interface StripSharedEditsArgs {
   runtimeDir: string;
   capId: string;
   sharedEdits: Array<{ file: string; marker: string }>;
-}): number {
+}
+
+/** stripCapabilitySharedEdits's edits, added to `plan` instead of saved. */
+function planStripCapabilitySharedEdits(plan: SharedFilePlan, args: StripSharedEditsArgs): number {
   const { runtimeDir, capId, sharedEdits } = args;
   let stripped = 0;
   for (const edit of sharedEdits) {
     const relFile = edit && typeof edit.file === 'string' ? edit.file : '';
     const file = confinedSharedFile(runtimeDir, relFile);
     if (file === null) continue; // unsafe path (absolute / .. / symlink escaping the scope root)
-    const settings = readJsonFile(file);
+    const settings = plannedSettings(plan, file);
     if (settings === null) continue; // missing/unparseable — nothing to strip
     let changed = false;
 
@@ -799,7 +915,7 @@ function stripCapabilitySharedEdits(args: {
       if (Object.keys(mo).length === 0) delete settings['mcpServers'];
     }
 
-    if (changed) writeJsonFileAtomic(file, settings);
+    if (changed) planSharedFileWrite(plan, file, settings);
   }
   return stripped;
 }
@@ -1109,6 +1225,17 @@ async function installCapability(spec: string, opts: LifecycleOptions): Promise<
     // CONC-3: nonce'd backup name prevents same-ms cross-process collision.
     const backupName = hadDir ? newBackupName(resolved.id) : null;
 
+    // #5315: dry-run the shared-file edits before anything changes. A symlinked shared file the user
+    // has not opted in to (GSD_ALLOW_SYMLINKED_DEST) is refused here, with no intent, promoted bundle
+    // or edited file to undo. Thrown later, after the swap, it would leave an intent for reconcile.
+    // The dry run and the real reapply below share one argument object so they cannot drift.
+    const sharedEditArgs: ReapplySharedEditsArgs = { runtimeDir, capId: resolved.id, stripFiles: candidateFiles, applyFiles: files, manifest };
+    try {
+      planReapplyCapabilitySharedEdits(new Map(), sharedEditArgs);
+    } catch (err) {
+      return { status: 'blocked', id: resolved.id, blockReasons: [(err as Error).message] };
+    }
+
     // INTENT: record BEFORE any filesystem mutation so a crash is recoverable (Codex R2 H1).
     // Kind 'upgrade' is used ONLY when BOTH a prior ledger entry AND the on-disk bundle exist (a
     // true reinstall-over-existing): the intent then carries the PRIOR metadata + a backup, so a
@@ -1143,7 +1270,7 @@ async function installCapability(spec: string, opts: LifecycleOptions): Promise<
     let backupDir: string | null = null;
     try {
       ({ backupDir } = promoteStagingToFinal(stagedDir, finalDir, backupName ?? undefined));
-      const sharedEdits = reapplyCapabilitySharedEdits({ runtimeDir, capId: resolved.id, stripFiles: candidateFiles, applyFiles: files, manifest });
+      const sharedEdits = reapplyCapabilitySharedEdits(sharedEditArgs);
       // COMMIT: rewrite WITHOUT _pending. Clearing the intent IS the commit.
       ledgerMod.recordInstall(runtimeDir, {
         id: resolved.id,
@@ -1301,6 +1428,15 @@ async function upgradeCapability(spec: string, opts: LifecycleOptions): Promise<
       ...files,
     ]));
 
+    // #5315: the same shared-file dry run as install, so a refused symlink blocks the upgrade
+    // before its intent is recorded and the old version stays live and untouched.
+    const sharedEditArgs: ReapplySharedEditsArgs = { runtimeDir, capId: resolved.id, stripFiles: candidateFiles, applyFiles: files, manifest: newManifest };
+    try {
+      planReapplyCapabilitySharedEdits(new Map(), sharedEditArgs);
+    } catch (err) {
+      return { status: 'blocked', id: resolved.id, blockReasons: [(err as Error).message] };
+    }
+
     // INTENT: record the in-flight upgrade BEFORE touching the filesystem. Its presence — not a
     // version comparison — is the commit signal reconcile uses (Codex R1 H3).
     // Wrap in try/catch so a disk failure (EPERM, ENOSPC, …) at the intent-write stage
@@ -1318,7 +1454,7 @@ async function upgradeCapability(spec: string, opts: LifecycleOptions): Promise<
       ({ backupDir } = promoteStagingToFinal(stagedDir, finalDir, backupName));
 
       // Re-derive shared edits across ALL candidate files: strip old marker entries, apply new.
-      const sharedEdits = reapplyCapabilitySharedEdits({ runtimeDir, capId: resolved.id, stripFiles: candidateFiles, applyFiles: files, manifest: newManifest });
+      const sharedEdits = reapplyCapabilitySharedEdits(sharedEditArgs);
 
       // COMMIT: rewrite the entry WITHOUT _pendingUpgrade. Clearing the intent IS the commit.
       const relCapDir = path.relative(runtimeDir, finalDir);
@@ -1405,12 +1541,19 @@ function removeCapability(id: string, opts: LifecycleOptions): RemoveResult {
     const entry = ledger && Object.prototype.hasOwnProperty.call(ledger.entries, id) ? ledger.entries[id] : null;
     if (!entry) return { status: 'not_installed', id };
 
-    // 1. Surgically strip capability-owned shared-config entries (user edits untouched).
-    const strippedEdits = stripCapabilitySharedEdits({
-      runtimeDir,
-      capId: id,
-      sharedEdits: Array.isArray(entry.sharedEdits) ? entry.sharedEdits : [],
-    });
+    // 1. Surgically strip capability-owned shared-config entries (user edits untouched). A
+    // symlinked shared file without GSD_ALLOW_SYMLINKED_DEST is refused before any file is
+    // written (#5315); nothing has been deleted yet, so report it as blocked and leave everything.
+    let strippedEdits: number;
+    try {
+      strippedEdits = stripCapabilitySharedEdits({
+        runtimeDir,
+        capId: id,
+        sharedEdits: Array.isArray(entry.sharedEdits) ? entry.sharedEdits : [],
+      });
+    } catch (err) {
+      return { status: 'blocked', id, blockReasons: [(err as Error).message] };
+    }
 
     // 2. Delete exactly the ledger-recorded files (guarded to under runtimeDir).
     const removedFiles: string[] = [];
